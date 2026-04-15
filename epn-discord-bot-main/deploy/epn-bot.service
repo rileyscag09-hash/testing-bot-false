@@ -1,0 +1,16 @@
+[Unit]
+Description=EPN Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/epn-discord-bot-main
+EnvironmentFile=/home/ubuntu/epn-discord-bot-main/.env
+ExecStart=/home/ubuntu/epn-discord-bot-main/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
