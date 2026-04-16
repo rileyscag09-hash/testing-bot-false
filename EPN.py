@@ -112,6 +112,10 @@ class EPN(commands.Bot):
             main_server = discord.Object(id=constants.main_server_id())
             await self.tree.sync(guild=main_server)
             logger.info(f"Commands synced to guild ID {main_server.id}")
+
+            await self.tree.sync()
+            logger.info("Global commands synced")
+
             self.synced = True
 
         except Exception as e:
