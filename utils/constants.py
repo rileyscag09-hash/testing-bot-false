@@ -6,6 +6,7 @@ import discord
 from dotenv import load_dotenv
 import sys
 from datetime import datetime
+from typing import Optional
 
 load_dotenv()
 
@@ -23,6 +24,18 @@ class Constants():
     def embed_color(self):
         DEFAULT_EMBED_COLOR = None
         return DEFAULT_EMBED_COLOR
+
+    def epn_embed_brand_name(self) -> str:
+        return os.getenv("EPN_EMBED_BRAND_NAME", "ER:LC Partner Network")
+
+    def epn_embed_footer_text(self) -> str:
+        return os.getenv("EPN_EMBED_FOOTER_TEXT", "EPN • Component Style System")
+
+    def epn_embed_icon_url(self) -> str:
+        return os.getenv("EPN_EMBED_ICON_URL", "")
+
+    def epn_embed_banner_url(self) -> str:
+        return os.getenv("EPN_EMBED_BANNER_URL", "")
 
     def token(self) -> str:
         """Retrieve the Discord bot token based on environment."""
@@ -264,7 +277,32 @@ class EmbedDesign:
     SECONDARY = 0x94a3b8
 
     @staticmethod
-    def create_embed(title: str, description: str = None, color: int = None, fields: list = None, thumbnail: str = None, footer: str = None):
+    def _footer_text(custom_footer: str = None) -> str:
+        return custom_footer or constants.epn_embed_footer_text()
+
+    @staticmethod
+    def _footer_icon() -> Optional[str]:
+        icon_url = constants.epn_embed_icon_url()
+        return icon_url or None
+
+    @staticmethod
+    def _banner_image() -> Optional[str]:
+        banner_url = constants.epn_embed_banner_url()
+        return banner_url or None
+
+    @staticmethod
+    def create_embed(
+        title: str,
+        description: str = None,
+        color: int = None,
+        fields: list = None,
+        thumbnail: str = None,
+        footer: str = None,
+        image: str = None,
+        author_name: str = None,
+        author_icon: str = None,
+        use_banner: bool = True
+    ):
 
         if color is None:
             color = EmbedDesign.NEUTRAL
@@ -287,8 +325,23 @@ class EmbedDesign:
         if thumbnail:
             embed.set_thumbnail(url=thumbnail)
 
-        if footer:
-            embed.set_footer(text=footer)
+        if author_name or author_icon or constants.epn_embed_icon_url():
+            embed.set_author(
+                name=author_name or constants.epn_embed_brand_name(),
+                icon_url=author_icon or constants.epn_embed_icon_url() or None
+            )
+
+        footer_text = EmbedDesign._footer_text(footer)
+        footer_icon = EmbedDesign._footer_icon()
+        if footer_text:
+            if footer_icon:
+                embed.set_footer(text=footer_text, icon_url=footer_icon)
+            else:
+                embed.set_footer(text=footer_text)
+
+        image_url = image or (EmbedDesign._banner_image() if use_banner else None)
+        if image_url:
+            embed.set_image(url=image_url)
 
         return embed
 
