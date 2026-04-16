@@ -33,11 +33,32 @@ class BanApprovalView(discord.ui.View):
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.secondary)
     async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BanDenialReasonModal(self.cog, self.request_id, self))
+
+
+class BanDenialReasonModal(discord.ui.Modal, title="Deny EPN Ban Request"):
+    def __init__(self, cog: "EPNCommands", request_id: int, view: BanApprovalView):
+        super().__init__()
+        self.cog = cog
+        self.request_id = request_id
+        self.view = view
+
+        self.denial_reason = discord.ui.TextInput(
+            label="Denial reason",
+            placeholder="Explain why this ban request is being denied",
+            required=True,
+            style=discord.TextStyle.paragraph,
+            max_length=1000
+        )
+        self.add_item(self.denial_reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
         await self.cog.handle_ban_approval(
             interaction=interaction,
             request_id=self.request_id,
             approved=False,
-            view=self
+            view=self.view,
+            denial_reason=str(self.denial_reason.value).strip()
         )
 
 
@@ -147,6 +168,82 @@ class EPNCommands(commands.Cog):
             logger.info(f"Could not DM user {user} ({user.id})")
         except Exception as e:
             logger.error(f"Error sending DM to user {user.id}: {e}")
+
+    async def send_requester_review_dm(
+        self,
+        requester: Union[discord.User, discord.Member],
+        target: Union[discord.User, discord.Member],
+        approved: bool,
+        reviewer: Union[discord.User, discord.Member],
+        source_guild_name: str,
+        reason: str,
+        evidence: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+        appealable: bool = True,
+        denial_reason: Optional[str] = None
+    ):
+        """Notify the original requester when a ban request is approved or denied."""
+        try:
+            if approved:
+                embed = EmbedDesign.success(
+                    title="EPN Ban Request Approved",
+                    description=(
+                        f"Your EPN ban request for **{target}** (`{target.id}`) has been approved.\n\n"
+                        f"The user has now been successfully banned from authorized EPN servers."
+                    )
+                )
+                embed.add_field(name="Approved By", value=reviewer.mention, inline=True)
+                embed.add_field(name="Source Guild", value=source_guild_name, inline=True)
+                embed.add_field(name="Reason", value=reason[:1024], inline=False)
+
+                if evidence:
+                    embed.add_field(name="Evidence", value=evidence[:1024], inline=False)
+
+                if expires_at:
+                    embed.add_field(name="Ban Expires", value=f"<t:{int(expires_at.timestamp())}:F>", inline=True)
+                else:
+                    embed.add_field(name="Duration", value="Permanent", inline=True)
+
+                embed.add_field(name="Appeals", value="Allowed" if appealable else "Not allowed", inline=True)
+            else:
+                embed = EmbedDesign.warning(
+                    title="EPN Ban Request Denied",
+                    description=(
+                        f"Your EPN ban request for **{target}** (`{target.id}`) has been denied."
+                    )
+                )
+                embed.add_field(name="Denied By", value=reviewer.mention, inline=True)
+                embed.add_field(name="Source Guild", value=source_guild_name, inline=True)
+                embed.add_field(name="Original Ban Reason", value=reason[:1024], inline=False)
+                embed.add_field(name="Denial Reason", value=(denial_reason or "No reason provided.")[:1024], inline=False)
+
+            await self._safe_dm_user(requester, embed)
+        except Exception as e:
+            logger.error(f"Error sending requester review DM to {requester.id}: {e}")
+
+    async def update_approval_request_message(
+        self,
+        request: dict,
+        embed: discord.Embed,
+        view: discord.ui.View
+    ) -> bool:
+        """Update the stored approval request message after review."""
+        try:
+            channel_id = request.get("channel_id")
+            message_id = request.get("message_id")
+            if not channel_id or not message_id:
+                return False
+
+            channel = self.bot.get_channel(int(channel_id))
+            if channel is None:
+                channel = await self.bot.fetch_channel(int(channel_id))
+
+            message = await channel.fetch_message(int(message_id))
+            await message.edit(embed=embed, view=view)
+            return True
+        except Exception as e:
+            logger.error(f"Error updating approval request message for request {request.get('id')}: {e}")
+            return False
 
     async def send_staff_log(self, guild: discord.Guild, embed: discord.Embed) -> bool:
         """Send a log embed to the configured log channel for this guild."""
@@ -554,7 +651,8 @@ class EPNCommands(commands.Cog):
         interaction: discord.Interaction,
         request_id: int,
         approved: bool,
-        view: discord.ui.View
+        view: discord.ui.View,
+        denial_reason: Optional[str] = None
     ):
         try:
             member = interaction.guild.get_member(interaction.user.id)
@@ -587,6 +685,17 @@ class EPNCommands(commands.Cog):
                 )
                 return
 
+            if not approved and not denial_reason:
+                await interaction.response.send_message(
+                    "A denial reason is required when denying a ban request.",
+                    ephemeral=True
+                )
+                return
+
+            requester = await self.bot.fetch_user(request["requested_by"])
+            target_user = await self.bot.fetch_user(request["user_id"])
+            source_guild_name = request.get("source_guild_name") or "Unknown"
+
             if not approved:
                 await self.bot.db.update_pending_ban_request_status(
                     request_id=request_id,
@@ -602,13 +711,49 @@ class EPNCommands(commands.Cog):
                 )
                 for field in old_embed.fields:
                     new_embed.add_field(name=field.name, value=field.value, inline=field.inline)
-                new_embed.add_field(name="Review Result", value=f"Denied by {interaction.user.mention}", inline=False)
+                new_embed.add_field(
+                    name="Review Result",
+                    value=(
+                        f"Denied by {interaction.user.mention}\n"
+                        f"Reason: {denial_reason}"
+                    ),
+                    inline=False
+                )
                 new_embed.timestamp = datetime.utcnow()
 
                 for item in view.children:
                     item.disabled = True
 
-                await interaction.response.edit_message(embed=new_embed, view=view)
+                await interaction.response.defer(ephemeral=True)
+                updated = await self.update_approval_request_message(request, new_embed, view)
+                if updated:
+                    await interaction.followup.send(
+                        embed=EmbedDesign.success(
+                            title="Ban Request Denied",
+                            description="The request has been denied and the requester has been notified."
+                        ),
+                        ephemeral=True
+                    )
+                else:
+                    await interaction.followup.send(
+                        embed=EmbedDesign.warning(
+                            title="Ban Request Denied",
+                            description="The request was denied, but I could not update the approval message."
+                        ),
+                        ephemeral=True
+                    )
+                await self.send_requester_review_dm(
+                    requester=requester,
+                    target=target_user,
+                    approved=False,
+                    reviewer=interaction.user,
+                    source_guild_name=source_guild_name,
+                    reason=request["reason"],
+                    evidence=request.get("evidence"),
+                    expires_at=request.get("expires_at"),
+                    appealable=request.get("appealable", True),
+                    denial_reason=denial_reason
+                )
                 return
 
             await interaction.response.defer()
@@ -652,7 +797,34 @@ class EPNCommands(commands.Cog):
             for item in view.children:
                 item.disabled = True
 
-            await interaction.edit_original_response(embed=new_embed, view=view)
+            updated = await self.update_approval_request_message(request, new_embed, view)
+            if updated:
+                await interaction.edit_original_response(
+                    content=None,
+                    embed=EmbedDesign.success(
+                        title="Ban Request Approved",
+                        description="The request has been approved and the requester has been notified."
+                    )
+                )
+            else:
+                await interaction.edit_original_response(
+                    content=None,
+                    embed=EmbedDesign.warning(
+                        title="Ban Request Approved",
+                        description="The request was approved, but I could not update the approval message."
+                    )
+                )
+            await self.send_requester_review_dm(
+                requester=requester,
+                target=user,
+                approved=True,
+                reviewer=interaction.user,
+                source_guild_name=source_guild_name,
+                reason=request["reason"],
+                evidence=request.get("evidence"),
+                expires_at=request.get("expires_at"),
+                appealable=request.get("appealable", True)
+            )
 
         except Exception as e:
             logger.error(f"Error handling ban approval for request {request_id}: {e}")
