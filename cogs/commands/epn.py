@@ -50,6 +50,40 @@ class EPNCommands(commands.Cog):
             time_window=3600,
             command_name="EPN_admin_commands"
         )
+        self.epn_status_role_names = {
+            "EPN staff team",
+            "Partner・Ownership",
+            "Partner・Staff",
+        }
+
+    async def get_main_server_member(self, user_id: int) -> Optional[discord.Member]:
+        """Fetch a user as a member of the main server, if possible."""
+        try:
+            guild = self.bot.get_guild(constants.main_server_id())
+            if guild is None:
+                guild = await self.bot.fetch_guild(constants.main_server_id())
+
+            if guild is None:
+                return None
+
+            member = guild.get_member(user_id)
+            if member is None:
+                member = await guild.fetch_member(user_id)
+
+            return member
+        except discord.NotFound:
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching main server member {user_id}: {e}")
+            return None
+
+    async def has_epn_status_permission(self, user_id: int) -> bool:
+        """Allow /epn status for members with one of the approved main-server roles."""
+        member = await self.get_main_server_member(user_id)
+        if member is None:
+            return False
+
+        return any(role.name in self.epn_status_role_names for role in member.roles)
 
     def parse_duration(self, duration_str: str) -> datetime:
         """Parse a duration string like '1d', '2h', '30m' into a datetime."""
@@ -645,6 +679,7 @@ class EPNCommands(commands.Cog):
                 fields=[
                     {"name": "ban", "value": "Ban a user across authorized servers except the main server", "inline": True},
                     {"name": "unban", "value": "Unban a user across authorized servers except the main server", "inline": True},
+                    {"name": "status", "value": "Check whether a user is currently EPN banned or unbanned", "inline": True},
                     {"name": "serverban", "value": "Ban a server from EPN", "inline": True},
                     {"name": "serverunban", "value": "Unban a server from EPN", "inline": True},
                     {"name": "history", "value": "View ban history for a user", "inline": True},
@@ -964,6 +999,89 @@ class EPNCommands(commands.Cog):
                 )
 
         await self.bot.command_verifier.verify_and_execute(ctx, command_logic)
+
+    @EPN_group.command(name="status", description="Check whether a user is currently EPN banned or unbanned")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.describe(user="The user to check (defaults to yourself)")
+    async def status(self, ctx: commands.Context, user: Optional[Union[discord.Member, discord.User]] = None):
+        if not await self.bot.db.is_server_authorized(ctx.guild.id):
+            await ctx.reply(
+                embed=EmbedDesign.error(
+                    title="Server Not Authorized",
+                    description="This server is not authorized for EPN access. Only authorized servers can use EPN commands."
+                ),
+                ephemeral=True
+            )
+            return
+
+        if not await self.has_epn_status_permission(ctx.author.id):
+            allowed_roles = ", ".join(f"`{role}`" for role in sorted(self.epn_status_role_names))
+            await ctx.reply(
+                embed=EmbedDesign.error(
+                    title="Permission Denied",
+                    description=f"You must have one of the following roles in the main EPN server to use this command: {allowed_roles}."
+                ),
+                ephemeral=True
+            )
+            return
+
+        target = user or ctx.author
+
+        active_ban = await self.bot.db.find_blacklist(target.id, active=True, use_cache=False)
+        latest_record = active_ban or await self.bot.db.get_blacklist_status(target.id)
+
+        is_banned = active_ban is not None
+        status_text = "EPN Banned" if is_banned else "EPN Unbanned"
+        status_emoji = "🚫" if is_banned else "✅"
+        status_color = EmbedDesign.ERROR if is_banned else EmbedDesign.SUCCESS
+        description = (
+            f"{status_emoji} **{target.mention}** is currently **{status_text}**."
+            if hasattr(target, "mention") else
+            f"{status_emoji} **{target}** is currently **{status_text}**."
+        )
+
+        embed = EmbedDesign.create_embed(
+            title="EPN Status Check",
+            description=description,
+            color=status_color
+        )
+        embed.add_field(name="User", value=f"{target} (`{target.id}`)", inline=False)
+        embed.add_field(name="Current Status", value=status_text, inline=True)
+
+        if hasattr(target, "display_avatar"):
+            embed.set_thumbnail(url=target.display_avatar.url)
+
+        if latest_record:
+            reason = latest_record.get("reason") or "No reason provided"
+            embed.add_field(name="Reason", value=reason[:1024], inline=False)
+
+            timestamp = latest_record.get("timestamp")
+            if timestamp:
+                embed.add_field(name="Last Recorded Action", value=f"<t:{int(timestamp.timestamp())}:F>", inline=True)
+
+            expires_at = latest_record.get("expires_at")
+            if is_banned:
+                embed.add_field(
+                    name="Duration",
+                    value=f"<t:{int(expires_at.timestamp())}:F>" if expires_at else "Permanent",
+                    inline=True
+                )
+                embed.add_field(
+                    name="Appeals",
+                    value="Allowed" if latest_record.get("appeal_allowed", True) else "Not allowed",
+                    inline=True
+                )
+            else:
+                updated_at = latest_record.get("updated_at")
+                if updated_at:
+                    embed.add_field(name="Last Updated", value=f"<t:{int(updated_at.timestamp())}:F>", inline=True)
+        else:
+            embed.add_field(name="Record", value="No blacklist history found for this user.", inline=False)
+
+        embed.set_footer(text="/epn history shows previous blacklist records")
+
+        await ctx.reply(embed=embed, ephemeral=True)
 
     @EPN_group.command(name="history", description="View ban history for a user")
     @app_commands.allowed_installs(guilds=True, users=False)
